@@ -8,7 +8,7 @@
 No outside help beyond the course handout, starter code, sample tests, and ChocoPy reference materials.
 
 ## Late Hours Consumed
-10
+17
 
 ---
 
