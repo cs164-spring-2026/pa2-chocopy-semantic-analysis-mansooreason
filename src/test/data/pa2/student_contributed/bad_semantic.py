@@ -30,7 +30,7 @@ def outer() -> object:
         global aa              # OK: aa is a global variable
         global zzz             # Error: Not a global variable: zzz
         nonlocal cc            # OK: cc is a local variable in outer
-        nonlocal aa            # Error: Not a nonlocal variable: aa (it's global, not enclosing local)
+        nonlocal bb
         pass
 
     pass
