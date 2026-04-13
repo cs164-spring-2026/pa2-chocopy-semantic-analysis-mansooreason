@@ -48,18 +48,3 @@ The same idea applies to function calls. If a function call has bad argument typ
 
 In general, inferring the most specific type after an error helps reduce cascading errors and makes the remaining error messages more accurate and more useful.
     
-### 2. What was the hardest component to implement in this assignment? Why was it challenging?
-
-The hardest part was getting the class hierarchy and subtype logic to work correctly together with error recovery.
-
-Classes affect a lot of other parts of the analysis at once: member lookup, method calls, inheritance, override checking, and joins for inferred types. Small mistakes in the hierarchy logic caused many unrelated tests to fail later in type checking. It was also tricky to recover cleanly after declaration errors, because we still needed enough class information to keep checking the rest of the program.
-
-Another difficult part was list typing. Lists are not handled the same way as simple class types, so we had to be careful about element types, empty lists, and how list concatenation should infer a result type.
-
-### 3. When type checking ill-typed expressions, why is it important to recover by inferring the most specific type? What is the problem if we simply infer the type object for every ill-typed expression?
-
-It is important because later checks depend on the inferred type of earlier expressions. If we always infer `object` after an error, then we lose useful information and create extra cascading errors.
-
-For example, in `bad types.py`, the expression `y + 1` is ill-typed because `y` is `bool`. But the `+` expression is still closer to an `int` result than to a totally unknown value. If we infer `object`, later code that uses that result may fail in ways that are not the real root problem. If we infer the most specific type we can, we report the original error while still letting the rest of the program be checked more accurately.
-
-The same idea applies to function calls. If the argument types are wrong but the callee is still a known function, it is better to infer the declared return type of that function than to collapse the whole expression to `object`. That keeps later type checking much more precise.
