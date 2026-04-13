@@ -1,75 +1,65 @@
-# CS 164: Programming Assignment 2
+# PA2 - ChocoPy Semantic Analysis
 
-[ChocoPy Specification]: https://sites.google.com/berkeley.edu/cs164-sp26/chocopy?authuser=1
+## Team Members
+- Mansoor Mamnoon
+- Eason Wei
 
-Note: Users running Windows should replace the colon (`:`) with a semicolon (`;`) in the classpath argument for all command listed below.
+## Acknowledgements
+No outside help beyond the course handout, starter code, sample tests, and ChocoPy reference materials.
 
-## Getting started
+## Late Hours Consumed
+10
 
-Run the following command to build your semantic analysis, and then run all the provided tests:
+---
 
-    mvn clean package
+## Writeup Questions
 
-    java -cp "chocopy-ref.jar:target/assignment.jar" chocopy.ChocoPy \
-        --pass=.s --dir src/test/data/pa2/sample/ --test
+### 1. How many passes does your semantic analysis perform over the AST?
 
+Our semantic analysis uses two passes over the AST.
 
-In the starter code, only two tests should pass. Your objective is to implement a semantic analysis that passes all the provided tests and meets the assignment specifications.
+The first pass is `DeclarationAnalyzer`. This pass builds the global symbol table and builds a `ClassHierarchy` that stores inheritance, class members, and method information. It also handles the declaration-level semantic checks, such as duplicate declarations, shadowing class names, checking superclass validity, checking method signatures, checking `global` and `nonlocal` declarations, and checking type annotations. Before the main declaration pass, we do two small pre-scans of the top-level declarations. One pre-scan collects all user-defined class names, and the other collects global variable names and types. This helps us handle forward references correctly.
 
-You can also run the semantic analysis on one input file at at time. In general, running the semantic analysis on a ChocoPy program is a two-step process. First, run the reference parser to get an AST JSON:
+The second pass is `TypeChecker`. This pass uses the symbol table and class hierarchy from the first pass to infer and annotate expression types. It checks literals, identifiers, unary and binary expressions, if-expressions, list expressions, index expressions, member expressions, function calls, method calls, assignments, returns, and control-flow statements like `if`, `while`, and `for`. When an expression is wrong, it still tries to infer the most specific type possible so that later checks can continue.
 
+### 2. What was the hardest component to implement in this assignment? Why was it challenging?
 
-    java -cp "chocopy-ref.jar:target/assignment.jar" chocopy.ChocoPy \
-        --pass=r <chocopy_input_file> --out <ast_json_file> 
+The hardest part was getting list subtyping and class error recovery to match the reference implementation.
 
+Lists were tricky because ChocoPy does not treat them like normal class subtyping. In general, lists are invariant, so `[int]` is not a subtype of `[object]`, even though `int` is a subtype of `object`. The special cases are `<None>` and `<Empty>`. A `<None>` value can be assigned to list variables, and `<Empty>` is used for the empty list literal `[]`. Handling these cases correctly took a lot of careful logic in the subtype checks.
 
-Second, run the semantic analysis on the AST JSON to get a typed AST JSON:
+The other hard part was error recovery for classes with bad members. We found that if a class has a member declaration error, the reference implementation skips type-checking the rest of that class body. That means expressions inside that class do not get annotated, and constructor calls for that class also stay unannotated. We had to track which classes had member errors and then use that information during type checking.
 
-    java -cp "chocopy-ref.jar:target/assignment.jar" chocopy.ChocoPy \
-        -pass=.s  <ast_json_file> --out <typed_ast_json_file>
+Another small but annoying part was matching error messages exactly. For example, methods with no parameters and methods with the wrong first parameter both need to use the same first-parameter error message in order to match the reference behavior.
 
+### 3. When type checking ill-typed expressions, why is it important to recover by inferring the most specific type? What is the problem if we simply infer the type `object` for every ill-typed expression?
 
-The `src/tests/data/pa2/sample` directory already contains the AST JSONs for the test programs (with extension `.ast`); therefore, you can skip the first step for the sample test programs.
+It is important because later type checks depend on the inferred types of earlier expressions. If we always recover with `object`, then we lose useful information and create extra errors that are not really the main problem.
 
-To observe the output of the reference implementation of the semantic analysis, replace the second step with the following command:
+For example, suppose we have:
 
+```python
+def bar() -> int:
+    return "oops"
+```
+The return statement is wrong, because the function says it returns int but the actual value is str. Even so, it is better to keep the function’s declared return type as int during recovery. If we changed everything to object, then later uses of bar() could cause extra fake errors that only happen because we threw away too much type information.
 
-    java -cp "chocopy-ref.jar:target/assignment.jar" chocopy.ChocoPy \
-        --pass=.r <ast_json_file> --out <typed_ast_json_file>
+The same idea applies to function calls. If a function call has bad argument types, but the callee is still known, it is better to recover using the function’s declared return type. That way, later code can still be checked in a useful way. If we always used object, then one bad argument could cause a lot of unrelated follow-up errors.
 
+In general, inferring the most specific type after an error helps reduce cascading errors and makes the remaining error messages more accurate and more useful.
+    
+### 2. What was the hardest component to implement in this assignment? Why was it challenging?
 
-In either step, you can omit the `--out <output_file>` argument to have the JSON be printed to standard output instead.
+The hardest part was getting the class hierarchy and subtype logic to work correctly together with error recovery.
 
-You can combine AST generation by the reference parser with your 
-semantic analysis as well:
+Classes affect a lot of other parts of the analysis at once: member lookup, method calls, inheritance, override checking, and joins for inferred types. Small mistakes in the hierarchy logic caused many unrelated tests to fail later in type checking. It was also tricky to recover cleanly after declaration errors, because we still needed enough class information to keep checking the rest of the program.
 
-    java -cp "chocopy-ref.jar:target/assignment.jar" chocopy.ChocoPy \
-        --pass=rs <chocopy_input_file> --out <typed_ast_json_file>
+Another difficult part was list typing. Lists are not handled the same way as simple class types, so we had to be careful about element types, empty lists, and how list concatenation should infer a result type.
 
+### 3. When type checking ill-typed expressions, why is it important to recover by inferring the most specific type? What is the problem if we simply infer the type object for every ill-typed expression?
 
-## Assignment specifications
+It is important because later checks depend on the inferred type of earlier expressions. If we always infer `object` after an error, then we lose useful information and create extra cascading errors.
 
-See the PA2 specification on the course
-website for a detailed specification of the assignment.
+For example, in `bad types.py`, the expression `y + 1` is ill-typed because `y` is `bool`. But the `+` expression is still closer to an `int` result than to a totally unknown value. If we infer `object`, later code that uses that result may fail in ways that are not the real root problem. If we infer the most specific type we can, we report the original error while still letting the rest of the program be checked more accurately.
 
-Refer to the ChocoPy Specification on the CS164 web site
-for the specification of the ChocoPy language. 
-
-## Receiving updates to this repository
-
-Add the `upstream` repository remotes (you only need to do this once in your local clone):
-
-    git remote add upstream https://github.com/cs164-spring-2026/pa2-chocopy-semantic-analysis.git
-
-
-To sync with updates upstream:
-
-    git pull upstream master
-
-## Submission writeup
-
-Team member 1: 
-
-Team member 2: 
-
-(Students should edit this section with their write-up)
+The same idea applies to function calls. If the argument types are wrong but the callee is still a known function, it is better to infer the declared return type of that function than to collapse the whole expression to `object`. That keeps later type checking much more precise.
