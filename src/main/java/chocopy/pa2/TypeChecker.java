@@ -50,22 +50,74 @@ import static chocopy.common.analysis.types.Type.NONE_TYPE;
 import static chocopy.common.analysis.types.Type.OBJECT_TYPE;
 import static chocopy.common.analysis.types.Type.STR_TYPE;
 
+/**
+ * Pass 2 of semantic analysis: type checking.
+ *
+ * Uses the symbol table and ClassHierarchy populated by DeclarationAnalyzer (Pass 1)
+ * to annotate every expression node with its inferred ValueType. Errors are reported
+ * using the most-specific-type recovery strategy described in Section 5.3.2:
+ * even when a premise of a typing rule fails, we infer the most specific type possible
+ * from the remaining premises so that downstream type checks stay accurate.
+ *
+ * Key behaviors:
+ *  - Constructor CallExpr: e.function is NOT annotated (stays null).
+ *    If the class has member errors, e itself is also not annotated.
+ *  - MethodCallExpr error on missing method: error on the MethodCallExpr node,
+ *    e.method (the MemberExpr) gets no inferredType.
+ *  - Assignment errors: leftmost-erroneous-target rule (spec Section 5.3.2).
+ *  - "in parameter N" index: N uses 0-offset for functions, 1-offset for methods
+ *    (so self is counted as parameter 0 in the error message).
+ *  - Classes with member errors (tracked in ClassHierarchy): the entire class body
+ *    is skipped during type-checking, matching the reference implementation.
+ */
 public class TypeChecker extends AbstractNodeAnalyzer<Type> {
 
+    /** The global symbol table from Pass 1. */
     private final SymbolTable<Type> globals;
+
+    /** The currently active symbol table (may be a function-local scope). */
     private SymbolTable<Type> sym;
+
     private final Errors errors;
     private final ClassHierarchy hierarchy;
 
+    /** Names of all module-level (top-level) variable declarations. */
     private final Set<String> moduleVarNames = new HashSet<>();
-    private Set<String> currentGlobals   = new HashSet<>();
+
+    /**
+     * Names explicitly declared with "global x" in the current function.
+     * Assignments to these names are allowed even though they are not in locallyDeclared.
+     */
+    private Set<String> currentGlobals = new HashSet<>();
+
+    /**
+     * Names explicitly declared with "nonlocal x" in the current function.
+     * Assignments to these names are allowed even though they are not in locallyDeclared.
+     */
     private Set<String> currentNonlocals = new HashSet<>();
-    private Set<String> locallyDeclared  = null;
 
+    /**
+     * All names declared locally in the current function (params + VarDefs + FuncDefs + global/nonlocal decls).
+     * Used to enforce Rule 8: assignments to variables not locally declared are rejected.
+     */
+    private Set<String> locallyDeclared = null;
+
+    /** Expected return type of the current function, or null at top level. */
     private ValueType currentReturnType = null;
-    private boolean   inFunction        = false;
-    private boolean   inClassBody       = false;
 
+    /** True when processing inside a function or method body. */
+    private boolean inFunction = false;
+
+    /**
+     * True when processing inside a class body (not a method).
+     * Affects where VarDef type mismatch errors are attached (on the VarDef node vs. its value).
+     */
+    private boolean inClassBody = false;
+
+    /**
+     * Stack of enclosing FuncDef nodes, used to resolve "nonlocal x" references
+     * by walking up the nesting hierarchy.
+     */
     private final List<FuncDef> functionStack = new ArrayList<>();
 
     public TypeChecker(SymbolTable<Type> globalSymbols, Errors errors,
@@ -76,6 +128,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         this.hierarchy = hierarchy;
     }
 
+    /** Convenience wrapper for reporting a semantic error. */
     private void err(Node node, String fmt, Object... args) {
         errors.semError(node, fmt, args);
     }
@@ -86,6 +139,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
 
     @Override
     public Type analyze(Program program) {
+        // Collect module-level variable names so GlobalDecl resolution works in TypeChecker.
         moduleVarNames.clear();
         for (Declaration d : program.declarations) {
             if (d instanceof VarDef) {
@@ -107,6 +161,8 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         Type initType = varDef.value.dispatch(this);
         if (initType instanceof ValueType) {
             if (!hierarchy.isSubtype((ValueType) initType, declared)) {
+                // In a class body, attach the error to the VarDef node itself;
+                // elsewhere, attach it to the initializer expression.
                 Node errorNode = inClassBody ? varDef : varDef.value;
                 err(errorNode, "Expected type `%s`; got type `%s`", declared, initType);
             }
@@ -115,18 +171,18 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     /**
-     * ClassDef type checking.
+     * Type-checks a class body.
      *
-     * KEY FIX: If the class has member declaration errors, skip the entire class body.
-     * The reference implementation does not annotate nodes inside classes with errors.
+     * If the class had any member declaration errors (tracked by ClassHierarchy),
+     * the entire body is skipped. This matches the reference implementation's behavior:
+     * no inferredType annotations appear inside the class, and the constructor call
+     * expression is also left unannotated (handled in analyze(CallExpr)).
      */
     @Override
     public Type analyze(ClassDef classDef) {
         String className = classDef.name.name;
 
-        // If the class has member errors, skip body type-checking entirely.
-        // This matches the reference: no inferredType annotations inside the class body,
-        // and no inferredType on constructor calls to this class.
+        // Skip body entirely if any member had a declaration error.
         if (hierarchy.classHasMemberErrors(className)) {
             return null;
         }
@@ -134,7 +190,8 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         SymbolTable<Type> prevSym = sym;
         sym = new SymbolTable<>(prevSym);
 
-        // Populate class scope with inherited + own members.
+        // Populate the class scope with all inherited and own members so that
+        // method bodies can reference self.attr and self.method() via the type checker.
         for (String c = className; c != null; c = hierarchy.getParent(c)) {
             for (String mName : hierarchy.directMemberNames(c)) {
                 if (!sym.declares(mName)) {
@@ -156,6 +213,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     public Type analyze(FuncDef funcDef) {
         ValueType retType = ValueType.annotationToValueType(funcDef.returnType);
 
+        // Save and update all context state for this function scope.
         ValueType         prevRet    = currentReturnType;
         boolean           prevInFun  = inFunction;
         boolean           prevInCls  = inClassBody;
@@ -174,12 +232,14 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         sym = new SymbolTable<>(prevSym);
         functionStack.add(funcDef);
 
+        // Add parameters to the local scope.
         for (TypedVar p : funcDef.params) {
             String pName = p.identifier.name;
             sym.put(pName, ValueType.annotationToValueType(p.type));
             locallyDeclared.add(pName);
         }
 
+        // Populate the local scope with all declarations in the function body.
         for (Declaration decl : funcDef.declarations) {
             String dName = decl.getIdentifier().name;
             locallyDeclared.add(dName);
@@ -190,6 +250,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             } else if (decl instanceof FuncDef) {
                 sym.put(dName, DeclarationAnalyzer.funcTypeFromFuncDef((FuncDef) decl));
             } else if (decl instanceof GlobalDecl) {
+                // "global x" makes x an alias for the global variable.
                 String gName = ((GlobalDecl) decl).variable.name;
                 if (moduleVarNames.contains(gName)) {
                     currentGlobals.add(gName);
@@ -197,9 +258,10 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                     sym.put(dName, (gType != null && gType.isValueType())
                             ? gType : OBJECT_TYPE);
                 } else {
-                    sym.put(dName, OBJECT_TYPE);
+                    sym.put(dName, OBJECT_TYPE); // invalid global; use object as fallback
                 }
             } else if (decl instanceof NonLocalDecl) {
+                // "nonlocal x" makes x an alias for a variable in an enclosing function.
                 String nlName = ((NonLocalDecl) decl).variable.name;
                 Type nlType   = resolveNonlocal(nlName);
                 currentNonlocals.add(nlName);
@@ -208,15 +270,18 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             }
         }
 
+        // Type-check all nested declarations then all statements.
         for (Declaration decl : funcDef.declarations) decl.dispatch(this);
         for (Stmt s : funcDef.statements) s.dispatch(this);
 
+        // Rule 9: functions with non-None/object return type must always return.
         if (!isNoneOrObject(retType) && !bodyAlwaysReturns(funcDef.statements)) {
             err(funcDef.name,
                     "All paths in this function/method must have a " +
                             "return statement: %s", funcDef.name.name);
         }
 
+        // Restore context state.
         functionStack.remove(functionStack.size() - 1);
         sym               = prevSym;
         currentReturnType = prevRet;
@@ -228,6 +293,11 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         return null;
     }
 
+    /**
+     * Resolves a nonlocal variable name by walking the functionStack from innermost
+     * to outermost, checking params then VarDefs in each enclosing function.
+     * Returns the declared type, or null if not found.
+     */
     private Type resolveNonlocal(String nlName) {
         for (int i = functionStack.size() - 1; i >= 0; i--) {
             FuncDef enc = functionStack.get(i);
@@ -256,6 +326,14 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     @Override
     public Type analyze(ExprStmt s) { s.expr.dispatch(this); return null; }
 
+    /**
+     * Type-checks an assignment statement (possibly multi-target).
+     *
+     * Error attachment rules (spec Section 5.3.2):
+     *  - If a target is not a valid assignable location, attach the error to that target node.
+     *  - If the RHS type doesn't conform to one or more targets, attach the error for the
+     *    LEFTMOST erroneous target to the AssignStmt node itself.
+     */
     @Override
     public Type analyze(AssignStmt s) {
         Type rhsType = s.value.dispatch(this);
@@ -270,6 +348,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                 Type       varType = sym.get(varName);
 
                 if (varType == null || !varType.isValueType()) {
+                    // Target identifier does not refer to a variable.
                     if (!id.hasError()) err(id, "Not a variable: %s", varName);
                     id.setInferredType(OBJECT_TYPE);
                 } else {
@@ -277,6 +356,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                             && !locallyDeclared.contains(varName)
                             && !currentGlobals.contains(varName)
                             && !currentNonlocals.contains(varName)) {
+                        // Rule 8: assigning to an implicitly inherited binding is forbidden.
                         if (!id.hasError()) {
                             err(id,
                                     "Cannot assign to variable that is not " +
@@ -285,6 +365,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                         id.setInferredType((ValueType) varType);
                     } else {
                         id.setInferredType((ValueType) varType);
+                        // Record leftmost type mismatch for the AssignStmt error.
                         if (rhsType instanceof ValueType && errorMsg == null) {
                             if (!hierarchy.isSubtype(
                                     (ValueType) rhsType, (ValueType) varType)) {
@@ -312,6 +393,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                 IndexExpr ie       = (IndexExpr) target;
                 Type      listType = ie.list.dispatch(this);
                 if (STR_TYPE.equals(listType)) {
+                    // Strings are not mutable sequences; indexing them as an assignment target is invalid.
                     if (!target.hasError()) err(target, "`str` is not a list type");
                     ie.index.dispatch(this);
                     target.setInferredType(OBJECT_TYPE);
@@ -334,6 +416,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             }
         }
 
+        // Attach the leftmost conformance error to the AssignStmt node.
         if (errorMsg != null && !s.hasError()) {
             err(errorNode, errorMsg);
         }
@@ -343,11 +426,13 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     @Override
     public Type analyze(ReturnStmt s) {
         if (!inFunction) {
+            // Rule 10: return at the top level.
             err(s, "Return statement cannot appear at the top level");
             if (s.value != null) s.value.dispatch(this);
             return null;
         }
         if (s.value == null) {
+            // Bare return: valid only when the return type is <None> or object.
             if (currentReturnType != null && !isNoneOrObject(currentReturnType)) {
                 err(s, "Expected type `%s`; got `None`", currentReturnType);
             }
@@ -384,10 +469,12 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         if (iterType instanceof ListValueType) {
             elemType = ((ListValueType) iterType).elementType;
         } else if (STR_TYPE.equals(iterType)) {
-            elemType = STR_TYPE;
+            elemType = STR_TYPE; // iterating over a string yields single-character strings
         } else if (iterType != null && !s.iterable.hasError()) {
             err(s.iterable, "Cannot iterate over value of type `%s`", iterType);
         }
+
+        // The loop variable must be a previously declared variable in scope.
         String varName = s.identifier.name;
         Type   varType = sym.get(varName);
         if (varType instanceof ValueType) {
@@ -402,7 +489,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     // -----------------------------------------------------------------------
-    // Literals
+    // Literals — each simply sets and returns the literal's known type.
     // -----------------------------------------------------------------------
 
     @Override public Type analyze(IntegerLiteral i) { return i.setInferredType(INT_TYPE);  }
@@ -422,6 +509,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             if (!id.hasError()) err(id, "Not a variable: %s", name);
             return id.setInferredType(OBJECT_TYPE);
         }
+        // FuncType identifiers (e.g., a function name used as a value) get annotated with FuncType.
         if (type instanceof FuncType) return id.setInferredType(type);
         if (!type.isValueType()) {
             if (!id.hasError()) err(id, "Not a variable: %s", name);
@@ -431,7 +519,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     // -----------------------------------------------------------------------
-    // Unary
+    // Unary expressions
     // -----------------------------------------------------------------------
 
     @Override
@@ -439,10 +527,12 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         Type t = e.operand.dispatch(this);
         switch (e.operator) {
             case "-":
+                // Unary minus is only defined on int; recover by inferring int.
                 if (INT_TYPE.equals(t)) return e.setInferredType(INT_TYPE);
                 err(e, "Cannot apply operator `%s` on type `%s`", e.operator, t);
                 return e.setInferredType(INT_TYPE);
             case "not":
+                // Logical not is only defined on bool; recover by inferring bool.
                 if (BOOL_TYPE.equals(t)) return e.setInferredType(BOOL_TYPE);
                 err(e, "Cannot apply operator `%s` on type `%s`", e.operator, t);
                 return e.setInferredType(BOOL_TYPE);
@@ -452,7 +542,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     // -----------------------------------------------------------------------
-    // Binary
+    // Binary expressions
     // -----------------------------------------------------------------------
 
     @Override
@@ -465,7 +555,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                     return e.setInferredType(INT_TYPE);
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
                         e.operator, t1, t2);
-                return e.setInferredType(INT_TYPE);
+                return e.setInferredType(INT_TYPE); // recover: arithmetic always yields int
             case "+":
                 if (INT_TYPE.equals(t1) && INT_TYPE.equals(t2))
                     return e.setInferredType(INT_TYPE);
@@ -478,6 +568,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                 }
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
                         e.operator, t1, t2);
+                // Recovery for ill-typed +: int if at least one operand is int; else object.
                 if (t1.isListType() || t2.isListType()
                         || Type.EMPTY_TYPE.equals(t1) || Type.EMPTY_TYPE.equals(t2))
                     return e.setInferredType(OBJECT_TYPE);
@@ -487,8 +578,9 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                     return e.setInferredType(BOOL_TYPE);
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
                         e.operator, t1, t2);
-                return e.setInferredType(BOOL_TYPE);
+                return e.setInferredType(BOOL_TYPE); // recover: comparisons always yield bool
             case "==": case "!=":
+                // Equality requires both operands to have the same non-None type.
                 if (t1 != null && t1.equals(t2) && !NONE_TYPE.equals(t1))
                     return e.setInferredType(BOOL_TYPE);
                 err(e, "Cannot apply operator `%s` on types `%s` and `%s`",
@@ -501,6 +593,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                         e.operator, t1, t2);
                 return e.setInferredType(BOOL_TYPE);
             case "is":
+                // "is" requires both operands to be non-special (non-primitive) types.
                 if (t1 != null && t2 != null
                         && !t1.isSpecialType() && !t2.isSpecialType())
                     return e.setInferredType(BOOL_TYPE);
@@ -512,7 +605,11 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         }
     }
 
-    /** Strict equality join for list element types. */
+    /**
+     * Computes the joined element type for a list concatenation (+) expression.
+     * Uses strict equality (not the full hierarchy join) because list concatenation
+     * in ChocoPy requires both operands to have the same element type.
+     */
     private ValueType listJoin(ValueType e1, ValueType e2) {
         if (e1.equals(e2)) return e1;
         if (e1 instanceof ListValueType && e2 instanceof ListValueType) {
@@ -532,6 +629,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         e.condition.dispatch(this);
         Type thenT = e.thenExpr.dispatch(this);
         Type elseT = e.elseExpr.dispatch(this);
+        // The inferred type is the join (least upper bound) of the two branch types.
         if (thenT instanceof ValueType && elseT instanceof ValueType) {
             return e.setInferredType(
                     hierarchy.join((ValueType) thenT, (ValueType) elseT));
@@ -546,8 +644,10 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     @Override
     public Type analyze(ListExpr e) {
         if (e.elements.isEmpty()) {
+            // The empty list literal has the special type <Empty>.
             return e.setInferredType(Type.EMPTY_TYPE);
         }
+        // Infer the element type by joining all element types left-to-right.
         Type elemType = e.elements.get(0).dispatch(this);
         for (int i = 1; i < e.elements.size(); i++) {
             Type t = e.elements.get(i).dispatch(this);
@@ -573,10 +673,11 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
             err(e, "Index is of non-integer type `%s`", indexType);
         }
         if (listType instanceof ListValueType) {
+            // list-select: infer the element type even when the index type was wrong.
             return e.setInferredType(((ListValueType) listType).elementType);
         }
         if (STR_TYPE.equals(listType)) {
-            return e.setInferredType(STR_TYPE);
+            return e.setInferredType(STR_TYPE); // string indexing yields a single-char string
         }
         if (listType != null && !e.hasError()) {
             err(e, "Cannot index into type `%s`", listType);
@@ -608,14 +709,14 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     // -----------------------------------------------------------------------
-    // Call expression
+    // Call expression (free function or constructor)
     //
-    // For constructor calls (ClassValueType):
-    //   - Do NOT set inferredType on e.function (stays null per reference output).
-    //   - If the class has member errors, do NOT set inferredType on e.
+    // Constructor calls (funcType is ClassValueType):
+    //   - e.function is NOT annotated (stays null), per reference output.
+    //   - If the class has member errors, e is also NOT annotated.
     //
-    // For function calls (FuncType):
-    //   - DO set inferredType on e.function.
+    // Function calls (funcType is FuncType):
+    //   - e.function IS annotated with the FuncType.
     // -----------------------------------------------------------------------
 
     @Override
@@ -623,6 +724,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         String funcName = e.function.name;
         Type   funcType = sym.get(funcName);
 
+        // Evaluate arguments regardless of whether the callee resolves correctly.
         List<Type> argTypes = new ArrayList<>();
         for (Expr arg : e.args) argTypes.add(arg.dispatch(this));
 
@@ -633,23 +735,24 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         }
 
         if (funcType instanceof ClassValueType) {
-            // Constructor: do NOT annotate e.function.
+            // Constructor call: do NOT annotate e.function (reference behavior).
             String className = funcType.className();
 
-            // If the class has member errors, do NOT annotate the CallExpr either.
             if (hierarchy.classHasMemberErrors(className)) {
+                // Class had member errors: do NOT annotate the CallExpr either.
                 Type initType = hierarchy.getMember(className, "__init__");
                 if (initType instanceof FuncType) {
                     FuncType ft = (FuncType) initType;
                     checkArgTypes(e, ft.parameters.subList(1, ft.parameters.size()),
                             argTypes, 1);
                 }
-                return OBJECT_TYPE; // don't call e.setInferredType
+                return OBJECT_TYPE; // intentionally omit e.setInferredType
             }
 
             Type initType = hierarchy.getMember(className, "__init__");
             if (initType instanceof FuncType) {
                 FuncType ft = (FuncType) initType;
+                // Skip self (index 0) when checking user-supplied arguments.
                 checkArgTypes(e, ft.parameters.subList(1, ft.parameters.size()),
                         argTypes, 1);
             } else if (!e.args.isEmpty()) {
@@ -659,8 +762,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         }
 
         if (funcType instanceof FuncType) {
-            // Regular function: annotate e.function.
-            e.function.setInferredType(funcType);
+            e.function.setInferredType(funcType); // annotate the function identifier
             FuncType ft = (FuncType) funcType;
             checkArgTypes(e, ft.parameters, argTypes, 0);
             return e.setInferredType(ft.returnType);
@@ -672,11 +774,11 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     }
 
     // -----------------------------------------------------------------------
-    // Method call
+    // Method call expression
     //
-    // When method NOT found: error on e (MethodCallExpr), e.method gets no inferredType.
+    // When method NOT found: error on the MethodCallExpr node; e.method gets NO inferredType.
     // When method IS found: e.method gets inferredType = FuncType.
-    // Parameter index uses offset=1 (self is param 0, user args start at 1).
+    // Argument offset = 1 so that "in parameter N" counts self as parameter 0.
     // -----------------------------------------------------------------------
 
     @Override
@@ -688,6 +790,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         for (Expr arg : e.args) argTypes.add(arg.dispatch(this));
 
         if (!(objType instanceof ClassValueType)) {
+            // Cannot call a method on a non-class type.
             err(e, "There is no method named `%s` in type `%s`", mName, objType);
             return e.setInferredType(OBJECT_TYPE);
         }
@@ -696,13 +799,14 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         Type   mType     = hierarchy.getMember(className, mName);
 
         if (!(mType instanceof FuncType)) {
-            // Method not found: error on e, e.method gets no inferredType.
+            // Method not found: error on MethodCallExpr, e.method stays unannotated.
             err(e, "There is no method named `%s` in class `%s`", mName, className);
             return e.setInferredType(OBJECT_TYPE);
         }
 
         FuncType ft = (FuncType) mType;
         e.method.setInferredType(ft);
+        // Skip self (index 0) when checking user-supplied arguments; offset=1 for error msg.
         checkArgTypes(e, ft.parameters.subList(1, ft.parameters.size()), argTypes, 1);
         return e.setInferredType(ft.returnType);
     }
@@ -712,11 +816,14 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
     // -----------------------------------------------------------------------
 
     /**
-     * Checks argument count and types.
+     * Validates argument count and types against the expected parameter list.
      *
-     * @param offset 0 for regular function calls, 1 for method calls (to skip self).
-     *               The "in parameter N" error message uses i+offset so N is the
-     *               full-list index (including self for methods).
+     * @param callNode  the call node to attach errors to
+     * @param expected  the expected parameter types (self already excluded for methods)
+     * @param actual    the inferred argument types
+     * @param offset    0 for function calls, 1 for method calls. Added to the loop index
+     *                  so that "in parameter N" correctly counts from the full parameter list
+     *                  (including self for methods).
      */
     private void checkArgTypes(Node callNode, List<ValueType> expected,
                                List<Type> actual, int offset) {
@@ -737,10 +844,20 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
         }
     }
 
+    /**
+     * Returns true iff the given return type is <None> or object,
+     * meaning an explicit return statement is not required.
+     */
     private boolean isNoneOrObject(ValueType t) {
         return NONE_TYPE.equals(t) || OBJECT_TYPE.equals(t);
     }
 
+    /**
+     * Returns true iff the given statement list always terminates with a return statement.
+     *
+     * Used for Rule 9 (missing return). The analysis is intentionally conservative:
+     * only a trailing ReturnStmt or an IfStmt whose both branches always return counts.
+     */
     private boolean bodyAlwaysReturns(List<Stmt> stmts) {
         if (stmts.isEmpty()) return false;
         Stmt last = stmts.get(stmts.size() - 1);
@@ -752,6 +869,7 @@ public class TypeChecker extends AbstractNodeAnalyzer<Type> {
                         && bodyAlwaysReturns(ifs.elseBody);
             }
         }
+        // As a fallback, scan for any return statement in the list.
         for (Stmt s : stmts) {
             if (s instanceof ReturnStmt) return true;
         }
